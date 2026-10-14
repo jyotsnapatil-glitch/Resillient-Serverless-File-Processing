@@ -1,0 +1,183 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Resilient serverless file processing pipeline.
+  S3 upload -> SQS (with DLQ) -> Lambda -> DynamoDB, monitored via CloudWatch.
+
+Parameters:
+  MaxReceiveCount:
+    Type: Number
+    Default: 3
+    Description: Delivery attempts before a message is moved to the Dead Letter Queue
+  EnableFailureInjection:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: When true, files whose name starts with "poison_" always fail (used to test the DLQ)
+  AlarmEmail:
+    Type: String
+    Default: ''
+    Description: Optional e-mail address notified when messages land in the DLQ
+
+Conditions:
+  HasAlarmEmail: !Not [!Equals [!Ref AlarmEmail, '']]
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Timeout: 30
+    MemorySize: 256
+    Architectures: [arm64]
+
+Resources:
+  # ---------- Messaging ----------
+  FileDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-file-dlq'
+      MessageRetentionPeriod: 1209600   # 14 days
+      SqsManagedSseEnabled: true
+
+  FileQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-file-queue'
+      VisibilityTimeout: 180            # >= 6x Lambda timeout (AWS guidance)
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt FileDeadLetterQueue.Arn
+        maxReceiveCount: !Ref MaxReceiveCount
+
+  FileQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref FileQueue]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowS3ToSendMessages
+            Effect: Allow
+            Principal: {Service: s3.amazonaws.com}
+            Action: sqs:SendMessage
+            Resource: !GetAtt FileQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Sub 'arn:aws:s3:::${AWS::StackName}-uploads-${AWS::AccountId}-${AWS::Region}'
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+
+  # ---------- Storage ----------
+  UploadBucket:
+    Type: AWS::S3::Bucket
+    DependsOn: FileQueuePolicy
+    Properties:
+      BucketName: !Sub '${AWS::StackName}-uploads-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      NotificationConfiguration:
+        QueueConfigurations:
+          - Event: s3:ObjectCreated:*
+            Queue: !GetAtt FileQueue.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - {Name: prefix, Value: uploads/}
+
+  ResultsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${AWS::StackName}-results'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - {AttributeName: file_id, AttributeType: S}
+      KeySchema:
+        - {AttributeName: file_id, KeyType: HASH}
+      SSESpecification: {SSEEnabled: true}
+
+  # ---------- Compute ----------
+  ProcessorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-processor'
+      CodeUri: src/processor/
+      Handler: app.lambda_handler
+      Description: Reads uploaded files referenced in SQS messages and stores results in DynamoDB
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref ResultsTable
+          ENABLE_FAILURE_INJECTION: !Ref EnableFailureInjection
+          LOG_LEVEL: INFO
+      Policies:   # least privilege: read one bucket, write one table
+        - S3ReadPolicy:
+            BucketName: !Ref UploadBucket
+        - DynamoDBWritePolicy:
+            TableName: !Ref ResultsTable
+      Events:
+        FileQueueEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt FileQueue.Arn
+            BatchSize: 5
+            FunctionResponseTypes: [ReportBatchItemFailures]   # retry only failed records
+
+  ProcessorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-processor'
+      RetentionInDays: 14
+
+  # ---------- Monitoring ----------
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Condition: HasAlarmEmail
+    Properties:
+      Subscription:
+        - {Protocol: email, Endpoint: !Ref AlarmEmail}
+
+  DlqNotEmptyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-dlq-not-empty'
+      AlarmDescription: Messages are sitting in the DLQ - investigate and redrive
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - {Name: QueueName, Value: !GetAtt FileDeadLetterQueue.QueueName}
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlarmEmail, [!Ref AlarmTopic], !Ref 'AWS::NoValue']
+
+  ProcessorErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-processor-errors'
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - {Name: FunctionName, Value: !Ref ProcessorFunction}
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlarmEmail, [!Ref AlarmTopic], !Ref 'AWS::NoValue']
+
+Outputs:
+  UploadBucketName: {Value: !Ref UploadBucket}
+  QueueUrl: {Value: !Ref FileQueue}
+  QueueArn: {Value: !GetAtt FileQueue.Arn}
+  DlqUrl: {Value: !Ref FileDeadLetterQueue}
+  DlqArn: {Value: !GetAtt FileDeadLetterQueue.Arn}
+  TableName: {Value: !Ref ResultsTable}
+  FunctionName: {Value: !Ref ProcessorFunction}
